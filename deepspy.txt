@@ -1,0 +1,549 @@
+--[[
+    DeepSpy - Runtime Game Interaction Spy
+    ========================================
+    Captures everything the obfuscated script DOES:
+    - Remote events/functions (FireServer, InvokeServer)
+    - Property changes on character/weapons
+    - New instances created
+    - Connections made
+    - Module requires
+    - Environment changes (walkspeed, jump, etc.)
+    
+    Run BEFORE the target script. Output goes to console
+    and saves a full log file.
+]]
+
+local LOG = {}
+local logCount = 0
+local MAX_LOGS = 2000
+local startTime = tick()
+
+-- ============================================
+-- LOGGING
+-- ============================================
+local function timestamp()
+    return string.format("[%.2fs]", tick() - startTime)
+end
+
+local function serialize(val, depth)
+    depth = depth or 0
+    if depth > 3 then return "..." end
+    
+    local t = typeof(val)
+    if t == "string" then
+        if #val > 200 then
+            return '"' .. val:sub(1, 200) .. '...[' .. #val .. ' chars]"'
+        end
+        return '"' .. val .. '"'
+    elseif t == "number" or t == "boolean" then
+        return tostring(val)
+    elseif t == "nil" then
+        return "nil"
+    elseif t == "Instance" then
+        return val:GetFullName()
+    elseif t == "Vector3" then
+        return string.format("Vector3(%g, %g, %g)", val.X, val.Y, val.Z)
+    elseif t == "CFrame" then
+        local p = val.Position
+        return string.format("CFrame(%g, %g, %g, ...)", p.X, p.Y, p.Z)
+    elseif t == "Color3" then
+        return string.format("Color3(%d, %d, %d)", val.R*255, val.G*255, val.B*255)
+    elseif t == "UDim2" then
+        return string.format("UDim2(%g, %d, %g, %d)", val.X.Scale, val.X.Offset, val.Y.Scale, val.Y.Offset)
+    elseif t == "EnumItem" then
+        return tostring(val)
+    elseif t == "table" then
+        local parts = {}
+        local count = 0
+        for k, v in pairs(val) do
+            count += 1
+            if count > 10 then
+                table.insert(parts, "... +" .. (select(2, next(val)) and "more" or ""))
+                break
+            end
+            local key = type(k) == "number" and "" or ("[" .. serialize(k, depth+1) .. "]=")
+            table.insert(parts, key .. serialize(v, depth+1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif t == "function" then
+        return "<function>"
+    else
+        return "<" .. t .. ">"
+    end
+end
+
+local function serializeArgs(...)
+    local args = {}
+    for i = 1, select("#", ...) do
+        table.insert(args, serialize(select(i, ...)))
+    end
+    return table.concat(args, ", ")
+end
+
+local function log(category, message)
+    logCount += 1
+    if logCount > MAX_LOGS then return end
+    
+    local entry = string.format("%s [%s] %s", timestamp(), category, message)
+    table.insert(LOG, entry)
+    print(entry)
+end
+
+local function saveLog()
+    if not writefile then return end
+    pcall(function()
+        writefile("deepspy_log.txt", table.concat(LOG, "\n"))
+        print("[DeepSpy] Log saved to deepspy_log.txt (" .. #LOG .. " entries)")
+    end)
+end
+
+-- ============================================
+-- HOOK: Remote Events & Functions
+-- ============================================
+local function hookRemotes()
+    local mt = getrawmetatable(game)
+    if not mt then 
+        log("WARN", "Cannot get raw metatable - remote hooking limited")
+        return 
+    end
+    
+    local oldNamecall = mt.__namecall
+    local oldIndex = mt.__index
+    
+    setreadonly(mt, false)
+    
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+        
+        -- Remote Events
+        if method == "FireServer" then
+            log("REMOTE", string.format(
+                "FireServer: %s(%s)", 
+                self:GetFullName(), 
+                serializeArgs(...)
+            ))
+        
+        -- Remote Functions
+        elseif method == "InvokeServer" then
+            log("REMOTE", string.format(
+                "InvokeServer: %s(%s)", 
+                self:GetFullName(), 
+                serializeArgs(...)
+            ))
+            local result = oldNamecall(self, ...)
+            log("REMOTE", string.format(
+                "  → returned: %s", 
+                serialize(result)
+            ))
+            return result
+        
+        -- HttpGet (script loading)
+        elseif method == "HttpGet" then
+            log("HTTP", string.format("HttpGet: %s", tostring(args[1])))
+        
+        -- SetAttribute
+        elseif method == "SetAttribute" then
+            if self:IsDescendantOf(game:GetService("Players").LocalPlayer) or 
+               self:IsDescendantOf(workspace) then
+                log("ATTR", string.format(
+                    "SetAttribute: %s.%s = %s",
+                    self:GetFullName(),
+                    tostring(args[1]),
+                    serialize(args[2])
+                ))
+            end
+        
+        -- Destroy
+        elseif method == "Destroy" and self:IsA("BasePart") then
+            log("INST", string.format("Destroy: %s", self:GetFullName()))
+        end
+        
+        return oldNamecall(self, ...)
+    end)
+    
+    -- Hook __index for property reads on specific objects
+    -- (too noisy for general use, but we track specific patterns)
+    
+    setreadonly(mt, true)
+    log("HOOK", "Remote hooks installed (FireServer, InvokeServer, HttpGet, SetAttribute)")
+end
+
+-- ============================================
+-- HOOK: Property Changes on Character
+-- ============================================
+local function hookCharacter()
+    local Players = game:GetService("Players")
+    local player = Players.LocalPlayer
+    if not player then return end
+    
+    local function watchHumanoid(humanoid)
+        if not humanoid then return end
+        
+        local origWalkSpeed = humanoid.WalkSpeed
+        local origJumpPower = humanoid.JumpPower
+        local origJumpHeight = humanoid.JumpHeight
+        local origMaxHealth = humanoid.MaxHealth
+        
+        humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if humanoid.WalkSpeed ~= origWalkSpeed then
+                log("CHAR", string.format(
+                    "WalkSpeed changed: %g → %g",
+                    origWalkSpeed, humanoid.WalkSpeed
+                ))
+                origWalkSpeed = humanoid.WalkSpeed
+            end
+        end)
+        
+        humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+            if humanoid.JumpPower ~= origJumpPower then
+                log("CHAR", string.format(
+                    "JumpPower changed: %g → %g",
+                    origJumpPower, humanoid.JumpPower
+                ))
+                origJumpPower = humanoid.JumpPower
+            end
+        end)
+        
+        humanoid:GetPropertyChangedSignal("JumpHeight"):Connect(function()
+            if humanoid.JumpHeight ~= origJumpHeight then
+                log("CHAR", string.format(
+                    "JumpHeight changed: %g → %g",
+                    origJumpHeight, humanoid.JumpHeight
+                ))
+                origJumpHeight = humanoid.JumpHeight
+            end
+        end)
+        
+        humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+            if humanoid.MaxHealth ~= origMaxHealth then
+                log("CHAR", string.format(
+                    "MaxHealth changed: %g → %g",
+                    origMaxHealth, humanoid.MaxHealth
+                ))
+                origMaxHealth = humanoid.MaxHealth
+            end
+        end)
+        
+        humanoid:GetPropertyChangedSignal("Health"):Connect(function()
+            if humanoid.Health > humanoid.MaxHealth then
+                log("CHAR", string.format(
+                    "Health exceeds max: %g / %g (possible god mode)",
+                    humanoid.Health, humanoid.MaxHealth
+                ))
+            end
+        end)
+        
+        log("CHAR", string.format(
+            "Watching humanoid - WS:%g JP:%g JH:%g MaxHP:%g",
+            origWalkSpeed, origJumpPower, origJumpHeight, origMaxHealth
+        ))
+    end
+    
+    local function watchCharacter(char)
+        if not char then return end
+        log("CHAR", "Character spawned: " .. char:GetFullName())
+        
+        local humanoid = char:WaitForChild("Humanoid", 10)
+        if humanoid then
+            watchHumanoid(humanoid)
+        end
+        
+        -- Watch for tool additions (weapon equips)
+        char.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then
+                log("TOOL", string.format("Equipped: %s", child.Name))
+            end
+        end)
+    end
+    
+    if player.Character then
+        watchCharacter(player.Character)
+    end
+    player.CharacterAdded:Connect(watchCharacter)
+    log("HOOK", "Character property watchers installed")
+end
+
+-- ============================================
+-- HOOK: Value objects (IntValue, NumberValue, etc.)
+-- Track when scripts modify game values
+-- ============================================
+local function hookValueChanges()
+    local function watchValues(parent, path)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("ValueBase") then
+                local origVal = child.Value
+                child.Changed:Connect(function(newVal)
+                    log("VALUE", string.format(
+                        "%s.%s changed: %s → %s",
+                        path, child.Name,
+                        serialize(origVal), serialize(newVal)
+                    ))
+                    origVal = newVal
+                end)
+            end
+        end
+    end
+    
+    -- Watch common value locations
+    local player = game:GetService("Players").LocalPlayer
+    if player then
+        pcall(function() watchValues(player, "Player") end)
+        pcall(function()
+            if player:FindFirstChild("leaderstats") then
+                watchValues(player.leaderstats, "leaderstats")
+            end
+            player.ChildAdded:Connect(function(child)
+                if child.Name == "leaderstats" then
+                    task.wait(0.5)
+                    watchValues(child, "leaderstats")
+                end
+            end)
+        end)
+    end
+    
+    log("HOOK", "Value change watchers installed")
+end
+
+-- ============================================
+-- HOOK: ModuleScript Decompilation
+-- When the VM creates/calls functions, try to decompile
+-- ============================================
+local function hookFunctionCreation()
+    if not hookfunction or not newcclosure then return end
+    
+    -- Hook getfenv to detect sandbox creation
+    pcall(function()
+        local origGetfenv = getfenv
+        hookfunction(getfenv, newcclosure(function(fn)
+            local result = origGetfenv(fn)
+            if type(fn) == "function" and decompile then
+                pcall(function()
+                    local src = decompile(fn)
+                    if src and #src > 200 then
+                        log("DECOMPILE", string.format(
+                            "Function decompiled (%d bytes): %s...",
+                            #src, src:sub(1, 300)
+                        ))
+                        if writefile then
+                            local name = "decompiled_fn_" .. tostring(logCount) .. ".lua"
+                            writefile(name, src)
+                            log("DECOMPILE", "Saved to " .. name)
+                        end
+                    end
+                end)
+            end
+            return result
+        end))
+    end)
+    
+    log("HOOK", "Function creation hooks installed")
+end
+
+-- ============================================
+-- HOOK: Workspace instance monitoring
+-- Track new parts, effects, billboards
+-- ============================================
+local function hookWorkspace()
+    local tracked = {
+        "Highlight", "BillboardGui", "Beam", "SelectionBox",
+        "BoxHandleAdornment", "SphereHandleAdornment", "ESP"
+    }
+    
+    local function isTracked(className)
+        for _, name in ipairs(tracked) do
+            if className == name or className:find(name) then
+                return true
+            end
+        end
+        return false
+    end
+    
+    -- Watch workspace for ESP/visual additions
+    workspace.DescendantAdded:Connect(function(desc)
+        if isTracked(desc.ClassName) then
+            log("VISUAL", string.format(
+                "Created %s: %s (Parent: %s)",
+                desc.ClassName,
+                desc.Name,
+                desc.Parent and desc.Parent:GetFullName() or "nil"
+            ))
+        end
+    end)
+    
+    -- Watch CoreGui for new GUIs
+    pcall(function()
+        game:GetService("CoreGui").DescendantAdded:Connect(function(desc)
+            if desc:IsA("ScreenGui") then
+                log("GUI", string.format(
+                    "New ScreenGui: %s",
+                    desc.Name
+                ))
+            end
+        end)
+    end)
+    
+    log("HOOK", "Workspace visual tracking installed")
+end
+
+-- ============================================
+-- HOOK: Camera manipulation detection
+-- ============================================
+local function hookCamera()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    
+    local origFOV = camera.FieldOfView
+    
+    camera:GetPropertyChangedSignal("FieldOfView"):Connect(function()
+        if math.abs(camera.FieldOfView - origFOV) > 5 then
+            log("CAMERA", string.format(
+                "FOV changed: %g → %g",
+                origFOV, camera.FieldOfView
+            ))
+        end
+        origFOV = camera.FieldOfView
+    end)
+    
+    camera:GetPropertyChangedSignal("CameraType"):Connect(function()
+        log("CAMERA", "CameraType changed to: " .. tostring(camera.CameraType))
+    end)
+    
+    log("HOOK", "Camera manipulation detection installed")
+end
+
+-- ============================================
+-- HOOK: Intercept table/environment manipulation
+-- Catch when the VM modifies game tables
+-- ============================================
+local function hookGameConfig()
+    -- Watch ReplicatedStorage for config modules
+    pcall(function()
+        local RS = game:GetService("ReplicatedStorage")
+        
+        RS.DescendantAdded:Connect(function(desc)
+            if desc:IsA("ModuleScript") then
+                log("MODULE", string.format(
+                    "New ModuleScript: %s",
+                    desc:GetFullName()
+                ))
+            end
+        end)
+        
+        -- Watch for changes to existing modules
+        for _, desc in ipairs(RS:GetDescendants()) do
+            if desc:IsA("ModuleScript") then
+                -- Try to hook require calls to this module
+            end
+        end
+    end)
+    
+    log("HOOK", "Game config monitoring installed")
+end
+
+-- ============================================
+-- PERIODIC: Save log and show stats
+-- ============================================
+local function startPeriodicSave()
+    task.spawn(function()
+        while true do
+            task.wait(30)
+            saveLog()
+        end
+    end)
+end
+
+-- ============================================
+-- INIT
+-- ============================================
+print(string.rep("=", 60))
+print("[DeepSpy] Initializing runtime spy...")
+print(string.rep("=", 60))
+
+hookRemotes()
+hookCharacter()
+hookValueChanges()
+hookFunctionCreation()
+hookWorkspace()
+hookCamera()
+hookGameConfig()
+startPeriodicSave()
+
+print(string.rep("=", 60))
+print("[DeepSpy] All hooks active! Now run the target script.")
+print("[DeepSpy] Watching for:")
+print("  • Remote calls (FireServer/InvokeServer)")
+print("  • Character stat changes (WalkSpeed, JumpPower, Health)")
+print("  • Value changes (leaderstats, configs)")
+print("  • Visual additions (ESP, Highlights, Beams)")
+print("  • Camera manipulation (FOV, CameraType)")
+print("  • GUI creation")
+print("  • HTTP requests")
+print("[DeepSpy] Log auto-saves every 30s to deepspy_log.txt")
+print("[DeepSpy] Run: savelog() to force-save anytime")
+print(string.rep("=", 60))
+
+-- Global helper to save log on demand
+getgenv().savelog = saveLog
+
+-- GUI indicator
+pcall(function()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "DeepSpyIndicator"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 220, 0, 50)
+    frame.Position = UDim2.new(0, 10, 0, 45)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    frame.BackgroundTransparency = 0.2
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 100, 50)
+    stroke.Thickness = 1
+    stroke.Transparency = 0.4
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -10, 0, 20)
+    title.Position = UDim2.new(0, 8, 0, 4)
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(255, 150, 50)
+    title.Font = Enum.Font.RobotoMono
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "🔍 DeepSpy Active"
+    title.Parent = frame
+
+    local stats = Instance.new("TextLabel")
+    stats.Size = UDim2.new(1, -10, 0, 18)
+    stats.Position = UDim2.new(0, 8, 0, 24)
+    stats.BackgroundTransparency = 1
+    stats.TextColor3 = Color3.fromRGB(180, 180, 180)
+    stats.Font = Enum.Font.RobotoMono
+    stats.TextSize = 10
+    stats.TextXAlignment = Enum.TextXAlignment.Left
+    stats.Text = "Logs: 0 | Remotes: 0"
+    stats.Parent = frame
+
+    gui.Parent = game:GetService("CoreGui")
+
+    local remoteCount = 0
+    task.spawn(function()
+        while gui and gui.Parent do
+            local rc = 0
+            for _, entry in ipairs(LOG) do
+                if entry:find("[REMOTE]", 1, true) then rc += 1 end
+            end
+            stats.Text = string.format("Logs: %d | Remotes: %d | %.0fs", #LOG, rc, tick() - startTime)
+            task.wait(1)
+        end
+    end)
+end)
